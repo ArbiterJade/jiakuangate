@@ -9,6 +9,9 @@ VPN Gate SSTP 节点检测流水线
   3. 按 host+port+protocol 去重
   4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
      (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
+  4.5 对初判为「住宅」的节点做二次校验: 用 ip-api.com 免费接口查出口 IP 的
+      hosting/proxy 标志, hosting=true 的踢回「机房」(误判修正);
+      校验失败(限流/网络异常)时保留原分类, 绝不让校验拖垮主流程
   5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
   6. 网页端 (GitHub Pages) 读取 data.json 展示
 
@@ -56,6 +59,14 @@ CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Wor
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
+# --- 住宅二次校验 (ip-api.com 免费接口, 无需 key; 免费版限流 45 次/分钟) ---
+VERIFY_RESIDENTIAL = os.environ.get("VERIFY_RESIDENTIAL", "1") == "1"  # 设为 0 可关闭二次校验
+VERIFY_MIN_INTERVAL = float(os.environ.get("VERIFY_MIN_INTERVAL", "1.5"))  # 串行调用间隔(秒), 保证不触发限流
+VERIFY_TIMEOUT = float(os.environ.get("VERIFY_TIMEOUT", "15"))            # 单次校验超时(秒)
+VERIFY_API = os.environ.get(
+    "VERIFY_API",
+    "http://ip-api.com/json/{ip}?fields=status,message,hosting,proxy,isp,org,as,query",
+)  # 注意: 免费版只支持 http, https 是付费功能
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -368,9 +379,70 @@ def check_all(nodes, session):
 
 
 # ---------------------------------------------------------------------------
+# 第 3.5 步: 住宅节点二次校验 (ip-api.com 免费接口)
+# ---------------------------------------------------------------------------
+def verify_exit_ip(ip, session):
+    """用 ip-api.com 查出口 IP 的 hosting/proxy 标志。
+    返回 (hosting, proxy, isp, org, error):
+      hosting=True  -> 机房/托管 IP (初判住宅 = 误判, 调用方负责改判)
+      proxy=True    -> 已知代理/VPN 出口 (仅标注不改判; VPN Gate 公开节点大量命中属正常)
+      出错/限流     -> 前四项为 None + error, 调用方保留原分类。"""
+    try:
+        r = session.get(VERIFY_API.format(ip=ip), timeout=VERIFY_TIMEOUT,
+                        headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        if r.status_code == 429:
+            return None, None, None, None, "rate-limited(429)"
+        if r.status_code != 200:
+            return None, None, None, None, f"HTTP {r.status_code}"
+        j = r.json()
+        if j.get("status") != "success":
+            return None, None, None, None, j.get("message") or "api-fail"
+        return (bool(j.get("hosting")), bool(j.get("proxy")),
+                j.get("isp"), j.get("org"), None)
+    except Exception as exc:
+        return None, None, None, None, f"{type(exc).__name__}"
+
+
+def verify_residential_nodes(results, session):
+    """对初判 residential 的成功节点逐个二次校验。
+    hosting=True -> 改判 datacenter (误判修正); 其余保留原分类并记录校验详情。
+    串行 + 间隔调用, 遵守 ip-api 免费版 45 次/分钟限流; 任何单点失败都不抛异常。"""
+    targets = [r for r in results
+               if r.get("success") and r.get("residential") == "residential"
+               and (r.get("exit") or {}).get("ip")]
+    verified = 0
+    reclassified = 0
+    skipped = 0
+    for i, r in enumerate(targets):
+        ip = r["exit"]["ip"]
+        if i:
+            time.sleep(VERIFY_MIN_INTERVAL)
+        hosting, proxy, isp, org, err = verify_exit_ip(ip, session)
+        v = {"checked": err is None, "hosting": hosting, "proxy": proxy,
+             "isp": isp, "org": org}
+        if err:
+            v["error"] = err
+            skipped += 1
+            log("VERIFY", f"[{i + 1}/{len(targets)}] {ip} 校验跳过({err}), 保留原分类")
+        elif hosting:
+            r["residential"] = "datacenter"
+            v["reclassified"] = True
+            reclassified += 1
+            log("VERIFY", f"[{i + 1}/{len(targets)}] {ip} hosting=true -> 改判机房 (原住宅为误判)")
+        else:
+            r["verified_residential"] = True
+            verified += 1
+            suffix = " (proxy=true, 已知代理出口, 仅标注)" if proxy else ""
+            log("VERIFY", f"[{i + 1}/{len(targets)}] {ip} hosting=false -> 住宅确认{suffix}")
+        r["verify"] = v
+    log("VERIFY", f"完成: 住宅确认 {verified} / 改判机房 {reclassified} / 跳过 {skipped}")
+    return {"verified": verified, "reclassified": reclassified, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
-def build_outputs(results, raw_count, sstp_count, source):
+def build_outputs(results, raw_count, sstp_count, source, verify_stats=None):
     available = [r for r in results if r.get("success")]
     countries = {}
     for n in available:
@@ -386,6 +458,8 @@ def build_outputs(results, raw_count, sstp_count, source):
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+        "verified_residential": sum(1 for n in available if n.get("verified_residential")),
+        "verify_reclassified": (verify_stats or {}).get("reclassified", 0),
     }
 
     by_country = {}
@@ -393,6 +467,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
+        grp["verified"] = sum(1 for n in grp["nodes"] if n.get("verified_residential"))
         grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
         by_country[name] = grp
 
@@ -435,7 +510,7 @@ def build_chains_text(data):
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
+                0 if n.get("verified_residential") else (1 if n.get("residential") == "residential" else 2),
                 n.get("latency_ms") is None,
                 n.get("latency_ms") or 0,
                 n.get("host") or "",
@@ -443,7 +518,7 @@ def build_chains_text(data):
         )
         lines.append("")
         lines.append(
-            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
+            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']}, 已验证 {grp.get('verified', 0)} / 机房 {grp['datacenter']}) ----"
         )
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
@@ -498,7 +573,7 @@ def build_hosts_text(data):
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
+                0 if n.get("verified_residential") else (1 if n.get("residential") == "residential" else 2),
                 n.get("latency_ms") is None,
                 n.get("latency_ms") or 0,
                 n.get("host") or "",
@@ -506,7 +581,7 @@ def build_hosts_text(data):
         )
         lines.append("")
         lines.append(
-            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']} / 机房 {grp['datacenter']}) ----"
+            f"# ---- {zh} {code} · {grp['count']} 节点 (住宅 {grp['residential']}, 已验证 {grp.get('verified', 0)} / 机房 {grp['datacenter']}) ----"
         )
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
@@ -583,7 +658,7 @@ def build_sub_text(data):
         nodes = sorted(
             grp["nodes"],
             key=lambda n: (
-                0 if n.get("residential") == "residential" else 1,
+                0 if n.get("verified_residential") else (1 if n.get("residential") == "residential" else 2),
                 n.get("latency_ms") is None,
                 n.get("latency_ms") or 0,
                 n.get("host") or "",
@@ -683,10 +758,19 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
+    # 3.5) 住宅二次校验 (只改判误判节点; 任何失败都不影响主流程)
+    verify_stats = {"verified": 0, "reclassified": 0, "skipped": 0}
+    if VERIFY_RESIDENTIAL:
+        log("VERIFY", "住宅节点二次校验开始 (ip-api.com)")
+        verify_stats = verify_residential_nodes(results, session)
+    else:
+        log("VERIFY", "二次校验已禁用 (VERIFY_RESIDENTIAL=0)")
+
     # 4) 结果 + 网页
-    data = build_outputs(results, raw_count, sstp_count, source)
+    data = build_outputs(results, raw_count, sstp_count, source, verify_stats)
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
+    log("RESULT", f"住宅确认: {verify_stats['verified']} / 改判机房: {verify_stats['reclassified']}")
 
     data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
