@@ -710,6 +710,15 @@ def write_outputs(data):
     sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
+
+    # 测速页: web/speedtest.html 是纯静态页, 直接复制到 public/ 发布
+    speedtest_src = os.path.join(REPO_DIR, "web", "speedtest.html")
+    if os.path.exists(speedtest_src):
+        with open(speedtest_src, "r", encoding="utf-8") as f:
+            speedtest_html = f.read()
+        with open(os.path.join(PUBLIC_DIR, "speedtest.html"), "w", encoding="utf-8") as f:
+            f.write(speedtest_html)
+
     return data_path, html_path, chains_path, hosts_path, sub_path
 
 
