@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CF 优选域名测速</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 860px; margin: 0 auto; padding: 20px; color: #222; background: #fafafa; }
+  h1 { font-size: 22px; margin-bottom: 6px; }
+  .desc { color: #666; font-size: 14px; line-height: 1.7; background: #fff;
+          border: 1px solid #e5e5e5; border-radius: 8px; padding: 12px 16px; }
+  .desc ol { margin: 8px 0 0; padding-left: 20px; }
+  .card { background: #fff; border: 1px solid #e5e5e5; border-radius: 8px;
+          padding: 16px; margin-top: 16px; }
+  .card h2 { font-size: 16px; margin: 0 0 10px; }
+  textarea { width: 100%; min-height: 130px; font-family: monospace; font-size: 13px;
+             padding: 10px; border: 1px solid #ccc; border-radius: 6px; resize: vertical; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 10px; }
+  .row label { font-size: 14px; color: #555; }
+  .row input[type=number] { width: 70px; padding: 6px; border: 1px solid #ccc; border-radius: 6px; }
+  .row input[type=text] { flex: 1; min-width: 200px; padding: 6px 8px;
+                         border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+  button { background: #1a73e8; color: #fff; border: none; border-radius: 6px;
+           padding: 10px 22px; font-size: 15px; cursor: pointer; }
+  button:disabled { background: #9db9e8; cursor: not-allowed; }
+  button.ghost { background: #fff; color: #1a73e8; border: 1px solid #1a73e8;
+                 padding: 8px 14px; font-size: 13px; }
+  #progressWrap { display: none; margin-top: 12px; }
+  #progressBar { height: 10px; background: #e8e8e8; border-radius: 5px; overflow: hidden; }
+  #progressFill { height: 100%; width: 0; background: #1a73e8; transition: width .2s; }
+  #progressText { font-size: 13px; color: #666; margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+  th, td { border-bottom: 1px solid #eee; padding: 8px 6px; text-align: left; }
+  th { color: #888; font-weight: normal; font-size: 13px; }
+  .ms-ok { color: #0a7d2c; font-weight: bold; }
+  .ms-warn { color: #b06000; }
+  .ms-bad { color: #c00; }
+  #output { font-family: monospace; font-size: 13px; background: #f6f8fa;
+            border: 1px solid #ddd; border-radius: 6px; padding: 10px;
+            word-break: break-all; margin-top: 10px; min-height: 44px; }
+  .tip { font-size: 13px; color: #888; margin-top: 8px; line-height: 1.6; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>🚀 CF 优选域名测速</h1>
+<div class="desc">
+  在你<strong>当前这台设备、当前这条宽带</strong>上实测各候选域名的延迟，挑出最快的几个，
+  一键生成 <code>EDGE_HOSTS</code> 配置。
+  <ol>
+    <li>（可选）点「加载公开优选域名列表」，或把你自己的候选粘进文本框，每行一个</li>
+    <li>点「开始测速」，等跑完</li>
+    <li>点「复制配置」，粘贴到 <code>vpngate.py</code> 的 <code>EDGE_HOSTS</code> 里，提交后重跑 Actions</li>
+  </ol>
+</div>
+
+<div class="card">
+  <h2>1️⃣ 候选域名 <span style="color:#888;font-weight:normal;font-size:13px">（每行一个，支持 domain 或 domain:port，# 后面是备注会被忽略）</span></h2>
+  <textarea id="candidates">saas.hemiaofei.cn
+sass.evone999.in
+sass.wanghaoxuan123.us.kg
+sass.zhufeilong.us.kg
+sass.zhiqiang.us.kg</textarea>
+  <div class="row">
+    <button class="ghost" id="loadListBtn">📥 加载公开优选域名列表（36个）</button>
+    <input type="text" id="listUrl" value="https://raw.githubusercontent.com/svip-s/cloudflare_ip/refs/heads/main/domain.txt">
+  </div>
+  <div class="tip">公开列表来自 GitHub 社区维护（svip-s/cloudflare_ip），加载后会自动去重追加。你也可以把 bestcf 等站挑的域名手动粘进来。</div>
+</div>
+
+<div class="card">
+  <h2>2️⃣ 测速参数</h2>
+  <div class="row">
+    <label>并发数 <input type="number" id="concurrency" value="6" min="1" max="20"></label>
+    <label>超时(秒) <input type="number" id="timeout" value="8" min="3" max="30"></label>
+    <label>每域名测 <input type="number" id="rounds" value="2" min="1" max="5"> 轮（取最快）</label>
+    <label>取 Top <input type="number" id="topN" value="5" min="1" max="50"> 个</label>
+  </div>
+  <div class="row">
+    <button id="startBtn">▶ 开始测速</button>
+  </div>
+  <div id="progressWrap">
+    <div id="progressBar"><div id="progressFill"></div></div>
+    <div id="progressText"></div>
+  </div>
+  <div class="tip">⚠️ 测速时请<strong>关闭代理 / VPN</strong>，否则测出来的是代理服务器的速度，不是你直连 Cloudflare 的真实延迟。</div>
+</div>
+
+<div class="card hidden" id="resultCard">
+  <h2>3️⃣ 测速结果</h2>
+  <table>
+    <thead><tr><th>#</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead>
+    <tbody id="resultBody"></tbody>
+  </table>
+</div>
+
+<div class="card hidden" id="outputCard">
+  <h2>4️⃣ 复制配置 → 填入 vpngate.py</h2>
+  <div id="output"></div>
+  <div class="row">
+    <button id="copyBtn">📋 复制 EDGE_HOSTS 配置</button>
+  </div>
+  <div class="tip">把上面复制的内容替换 <code>vpngate.py</code> 里 <code>EDGE_HOSTS</code> 默认值双引号中的部分
+    （每个地址带 <code>:443</code>，逗号分隔），Commit 后去 Actions 手动跑一次即可生效。</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// 解析候选文本: 每行一个, 支持 domain / domain:port, 去掉 #备注, 去重
+function parseCandidates(text) {
+  const out = [], seen = new Set();
+  for (const line of text.split('\n')) {
+    let s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    s = s.split('#')[0].trim();                       // 去掉 #备注
+    s = s.replace(/^https?:\/\//i, '').split('/')[0].trim();
+    const host = s.split(':')[0].trim().toLowerCase(); // 去掉端口
+    if (!host || seen.has(host)) continue;
+    seen.add(host); out.push(host);
+  }
+  return out;
+}
+
+// 测一次: no-cors 下 opaque 响应也算成功, 可拿到建连耗时
+async function measure(host, timeoutMs) {
+  const t0 = performance.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    await fetch('https://' + host + '/?_cfst=' + Date.now(), {
+      mode: 'no-cors', cache: 'no-store', credentials: 'omit',
+      redirect: 'follow', signal: ctrl.signal,
+    });
+    return { ok: true, ms: performance.now() - t0, timeout: false };
+  } catch (e) {
+    const ms = performance.now() - t0;
+    return { ok: false, ms, timeout: !!(e && e.name === 'AbortError') };
+  } finally { clearTimeout(timer); }
+}
+
+// 并发池
+async function runPool(jobs, concurrency, onDone) {
+  let i = 0, done = 0;
+  const workers = Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
+    while (i < jobs.length) {
+      const job = jobs[i++];
+      await job();
+      done++; onDone(done, jobs.length);
+    }
+  });
+  await Promise.all(workers);
+}
+
+$('loadListBtn').onclick = async () => {
+  const btn = $('loadListBtn');
+  btn.disabled = true; btn.textContent = '加载中…';
+  try {
+    const r = await fetch($('listUrl').value.trim(), { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = await r.text();
+    const fresh = parseCandidates(text);
+    const cur = parseCandidates($('candidates').value);
+    const merged = [...cur];
+    for (const h of fresh) if (!cur.includes(h)) merged.push(h);
+    $('candidates').value = merged.join('\n');
+    alert('已加载 ' + fresh.length + ' 个，合并去重后共 ' + merged.length + ' 个候选');
+  } catch (e) {
+    alert('加载失败：' + e.message + '\n可手动把域名粘进文本框');
+  } finally {
+    btn.disabled = false; btn.textContent = '📥 加载公开优选域名列表（36个）';
+  }
+};
+
+$('startBtn').onclick = async () => {
+  const hosts = parseCandidates($('candidates').value);
+  if (!hosts.length) { alert('候选列表是空的'); return; }
+  const concurrency = Math.max(1, parseInt($('concurrency').value) || 6);
+  const timeoutMs = Math.max(3000, (parseInt($('timeout').value) || 8) * 1000);
+  const rounds = Math.max(1, Math.min(5, parseInt($('rounds').value) || 2));
+  const topN = Math.max(1, parseInt($('topN').value) || 5);
+
+  const btn = $('startBtn');
+  btn.disabled = true; btn.textContent = '测速中…';
+  $('resultCard').classList.add('hidden');
+  $('outputCard').classList.add('hidden');
+  $('progressWrap').style.display = 'block';
+
+  // 每个 host 测 rounds 轮, 全部打进任务池
+  const results = new Map(hosts.map(h => [h, []]));
+  const jobs = [];
+  for (const h of hosts)
+    for (let r = 0; r < rounds; r++)
+      jobs.push(async () => { results.get(h).push(await measure(h, timeoutMs)); });
+
+  await runPool(jobs, concurrency, (done, total) => {
+    $('progressFill').style.width = (done / total * 100).toFixed(1) + '%';
+    $('progressText').textContent = `已完成 ${done} / ${total}`;
+  });
+
+  // 汇总: 取每轮最快; 分组排序: 成功 > 连接异常 > 超时
+  const rows = hosts.map(h => {
+    const rs = results.get(h);
+    const oked = rs.filter(x => x.ok);
+    const best = oked.length ? Math.min(...oked.map(x => x.ms)) : null;
+    const anyTimeout = rs.some(x => x.timeout);
+    const refMs = rs.length ? Math.min(...rs.map(x => x.ms)) : null;
+    return { host: h, best, anyTimeout, refMs,
+             ok: oked.length > 0 };
+  });
+  const rank = r => r.ok ? 0 : (r.anyTimeout && r.best === null ? 2 : 1);
+  rows.sort((a, b) => (rank(a) - rank(b)) || ((a.best ?? a.refMs ?? 1e9) - (b.best ?? b.refMs ?? 1e9)));
+
+  // 渲染表格
+  const tb = $('resultBody'); tb.innerHTML = '';
+  rows.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    let msHtml, status;
+    if (r.ok) { msHtml = `<span class="ms-ok">${r.best.toFixed(0)} ms</span>`; status = '✅ 成功'; }
+    else if (!r.anyTimeout) { msHtml = `<span class="ms-warn">${r.refMs.toFixed(0)} ms</span>`; status = '⚠️ 连接异常（延迟仅供参考）'; }
+    else { msHtml = `<span class="ms-bad">—</span>`; status = '❌ 超时'; }
+    tr.innerHTML = `<td>${i + 1}</td><td><code>${r.host}</code></td><td>${msHtml}</td><td>${status}</td>`;
+    tb.appendChild(tr);
+  });
+  $('resultCard').classList.remove('hidden');
+
+  // 生成 EDGE_HOSTS 配置: 只取成功的 Top N
+  const picked = rows.filter(r => r.ok).slice(0, topN).map(r => r.host + ':443');
+  const out = $('output');
+  if (picked.length) {
+    out.textContent = picked.join(',');
+    $('outputCard').classList.remove('hidden');
+  } else {
+    out.textContent = '没有测速成功的候选，请检查网络或更换候选列表';
+    $('outputCard').classList.remove('hidden');
+  }
+
+  $('progressText').textContent = `完成：${hosts.length} 个候选 × ${rounds} 轮，成功 ${rows.filter(r => r.ok).length} 个`;
+  btn.disabled = false; btn.textContent = '▶ 开始测速';
+};
+
+$('copyBtn').onclick = async () => {
+  const text = $('output').textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    $('copyBtn').textContent = '✅ 已复制';
+  } catch (e) {
+    // 降级: 选中文本让用户手动复制
+    const range = document.createRange();
+    range.selectNodeContents($('output'));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+    $('copyBtn').textContent = '⚠️ 已选中，请按 Ctrl+C 复制';
+  }
+  setTimeout(() => { $('copyBtn').textContent = '📋 复制 EDGE_HOSTS 配置'; }, 2000);
+};
+</script>
+</body>
+</html>
