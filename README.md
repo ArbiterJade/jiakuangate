@@ -6,7 +6,7 @@
 
 ## 功能特性
 
-- **自动抓取**：从 VPN Gate 官方 API 获取实时节点列表，失败时自动回退 GitHub 镜像源
+- **自动抓取**：三层数据源链（官方 API → jsDelivr CDN 镜像 → GitHub 镜像），每层失败自动重试 3 次再换下一层
 - **SSTP 筛选**：只保留带 TCP 入口的中继（可走 SSTP/xray 链），UDP-only 节点直接丢弃
 - **可用性检测**：并发调用 Cloudflare Worker 实际拨测每个节点，以 Worker 返回的 `success` 为准
 - **住宅/机房分类**：按可信度三级判定——Worker 返回的真实 `is_datacenter` 标志 → 出口 ASN 组织名关键词 → host 前缀启发式
@@ -16,7 +16,7 @@
 ## 工作流程
 
 ```
-1. 获取 VPN Gate 原始节点（官方 api/iphone CSV → 失败回退镜像）
+1. 获取 VPN Gate 原始节点（三层链：官方 api/iphone CSV → jsDelivr 镜像 CSV → GitHub 镜像 JSON，每层 3 次重试）
 2. 筛选 SSTP 节点（OpenVPN 配置中 proto tcp + remote 端口）
 3. 按 host+port+protocol 去重
 4. 并发调用 Cloudflare Worker 检测（GET /check?proxyip=host:port）
@@ -41,7 +41,11 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `CHECK_WORKER` | `https://jiakuan.yorons.com/check?sstp=vpn:vpn@` | 检测用 Cloudflare Worker 地址 |
+| `CHECK_WORKER` | `https://jiakuan.yorons.com/check?sstp=vpn:vpn@` | 主检测 Worker 地址 |
+| `CHECK_WORKER_FALLBACK` | `https://check.helei.kdns.fr/check?sstp=vpn:vpn@` | 备用 Worker；主 Worker 自身故障（连接失败/非 200/坏 JSON）时自动切换，节点本身不可用不触发 |
+| `FETCH_RETRIES` | `3` | 每个数据源失败后的重试次数 |
+| `FETCH_BACKOFF` | `3,8` | 重试等待秒数（逗号分隔，依次取用） |
+| `HOSTS_URL` | `https://arbiterjade.github.io/jiakuangate/hosts.txt` | hosts.txt 头部注释里的固定地址 |
 | `CHECK_CONCURRENCY` | `32` | 检测并发数 |
 | `CHECK_TIMEOUT` | `90` | 单节点检测超时（秒） |
 | `MAX_CHECK_NODES` | `0`（不限） | 限制检测节点数，本地测试可用小值 |

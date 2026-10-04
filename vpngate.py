@@ -61,6 +61,12 @@ VPNGATE_MIRROR_JSON = os.environ.get(
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://jiakuan.yorons.com/check?sstp=vpn:vpn@")
+# 备用检测 Worker: 主 Worker 自身故障 (连接失败/非 200/坏 JSON) 时自动切换;
+# 节点本身不可用 (Worker 正常返回 success=false) 不会触发切换
+WORKER_CHECK_URL_FALLBACK = os.environ.get(
+    "CHECK_WORKER_FALLBACK",
+    "https://check.helei.kdns.fr/check?sstp=vpn:vpn@",
+)
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -344,10 +350,11 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
-def check_one(node, session):
-    """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
-    单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+def _check_via_worker(node, session, worker_url):
+    """用单个 Worker 检测单节点。返回 out dict。
+    worker_error=True 表示 Worker 自身故障 (网络错误/非 200/坏 JSON);
+    节点不可用时 success=False 但 worker_error 不置位。"""
+    url = worker_url + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -392,6 +399,24 @@ def check_one(node, session):
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
         return out
+
+
+def check_one(node, session):
+    """调用 Worker 检测单节点。主 Worker 自身故障时自动切备用 Worker 再试一次;
+    两个都故障才记 worker_error。单节点失败不会抛出, 统一记 success=False。"""
+    out = _check_via_worker(node, session, WORKER_CHECK_URL)
+    out["worker_via"] = "primary"
+    if out.get("worker_error") and WORKER_CHECK_URL_FALLBACK \
+            and WORKER_CHECK_URL_FALLBACK != WORKER_CHECK_URL:
+        log("CLOUDFLARE WORKER", f"主 Worker 故障 ({out.get('error')}), 切换备用 Worker 重试: "
+            f"{node['host']}:{node['port']}")
+        fb = _check_via_worker(node, session, WORKER_CHECK_URL_FALLBACK)
+        if not fb.get("worker_error"):
+            fb["worker_via"] = "fallback"
+            return fb
+        out["error"] = f"{out.get('error')} | 备用 Worker 也失败: {fb.get('error')}"
+        out["worker_via"] = "primary+fallback-failed"
+    return out
 
 
 def check_all(nodes, session):
@@ -501,6 +526,7 @@ def build_outputs(results, raw_count, sstp_count, source, verify_stats=None):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
         "worker": WORKER_CHECK_URL,
+        "worker_fallback": WORKER_CHECK_URL_FALLBACK or None,
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -566,7 +592,7 @@ EDGE_HOSTS = [
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://arbiterjade.github.io/jiakuangate/hosts.txt")
 
 
 def build_hosts_text(data):
