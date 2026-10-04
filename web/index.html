@@ -15,6 +15,8 @@
   .wrap { max-width: 1100px; margin: 0 auto; }
   h1 { font-size: 22px; margin-bottom: 4px; }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .stale { background: rgba(255,90,90,.12); border: 1px solid #ff5a5a; color: #ffb3b3;
+    border-radius: 12px; padding: 12px 16px; font-size: 14px; margin-bottom: 18px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
   .card .k { color: var(--muted); font-size: 12px; }
@@ -46,6 +48,8 @@
 <div class="wrap">
   <h1>VPN Gate · SSTP 节点检测</h1>
   <div class="sub">节点来自 VPN Gate（仅 TCP 入口中继），检测由 Cloudflare Worker 执行，GitHub Actions 定时刷新</div>
+
+  <div class="stale" id="stale" style="display:none"></div>
 
   <div class="cards" id="cards"></div>
 
@@ -132,9 +136,25 @@ function renderCountries() {
 function render() {
   renderCards(DATA);
   renderCountries();
+  renderStale();
   const s = DATA.stats || {};
   document.getElementById("foot").textContent =
     "数据时间 " + (DATA.generated_at || "?") + " · 来源 " + (DATA.source || "?") + " · 可用 " + (s.success || 0) + " / 检测 " + (s.checked || 0) + " · 点击 host:port 复制 sstp 链接";
+}
+
+function renderStale() {
+  const el = document.getElementById("stale");
+  const ts = Date.parse((DATA.generated_at || "").replace(" UTC", "Z").replace(" ", "T"));
+  if (!isNaN(ts)) {
+    const hours = (Date.now() - ts) / 3600000;
+    if (hours > 2) {
+      el.style.display = "block";
+      el.textContent = "⚠️ 数据已过期 " + hours.toFixed(1) + " 小时（最后更新 " + DATA.generated_at +
+        "），流水线可能失败，等待下一次刷新。请以 data.json 的时间为准。";
+      return;
+    }
+  }
+  el.style.display = "none";
 }
 
 function setFilter(f) {
