@@ -48,9 +48,15 @@ for _stream in (sys.stdout, sys.stderr):
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
-# 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
-VPNGATE_MIRROR = os.environ.get(
-    "VPNGATE_MIRROR",
+# 回退链 (按顺序尝试, 三者基础设施互相独立):
+#  1) jsDelivr CDN 镜像: 每 30 分钟快照, 与官方 API 同 CSV 格式
+VPNGATE_MIRROR_CSV = os.environ.get(
+    "VPNGATE_MIRROR_CSV",
+    "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/vpngate.csv",
+)
+#  2) GitHub raw JSON 镜像: 每日多次更新 (字段与官方 CSV 同源)
+VPNGATE_MIRROR_JSON = os.environ.get(
+    "VPNGATE_MIRROR",  # 兼容旧环境变量名
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
@@ -128,24 +134,6 @@ def die(msg):
 # ---------------------------------------------------------------------------
 # 第 1 步: 获取 VPN Gate 原始节点
 # ---------------------------------------------------------------------------
-# ============================================================================
-# vpngate.py 修复补丁: 数据源获取加重试 (解决 Actions 偶发 11 秒失败)
-#
-# 用法: 用下面整个代码块, 替换 vpngate.py 第 128~163 行
-#   (从 "# ---------------------------------------------------------------------------"
-#    紧接着 "# 第 1 步: 获取 VPN Gate 原始节点" 的那段,
-#    到 'die("VPN Gate 官方 API 与回退镜像均不可用, ...")' 那一行为止)
-#
-# 改动说明:
-#   - 每个数据源(官方 API / GitHub 镜像)失败后会自动重试, 默认 3 次,
-#     每次间隔 3 秒、8 秒 (可通过环境变量 FETCH_RETRIES / FETCH_BACKOFF 调整)
-#   - 只有两个源、每次重试都失败, 才会 die (exit 1)
-#   - 日志里会打出 "第x/3次" 和等待秒数, 方便以后看日志判断
-# ============================================================================
-
-# ---------------------------------------------------------------------------
-# 第 1 步: 获取 VPN Gate 原始节点
-# ---------------------------------------------------------------------------
 FETCH_RETRIES = max(1, int(os.environ.get("FETCH_RETRIES", "3")))  # 每个数据源重试次数
 FETCH_BACKOFF = os.environ.get("FETCH_BACKOFF", "3,8")              # 重试等待秒数 (逗号分隔)
 
@@ -172,40 +160,32 @@ def _get_with_retries(url, timeout, headers, label):
 
 def fetch_vpngate():
     """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
-    官方 API 失败时回退镜像 JSON; 两个源各重试多次后仍失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
-    try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = _get_with_retries(
-            VPNGATE_API,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
-            label="官方 API",
-        )
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
-
-    # --- 回退源: GitHub 预解析镜像 ---
-    try:
-        log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
-        resp = _get_with_retries(
-            VPNGATE_MIRROR,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0"},
-            label="回退镜像",
-        )
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
-    except Exception as exc:
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
+    按顺序尝试三个数据源 (官方 API -> jsDelivr CSV 镜像 -> GitHub JSON 镜像),
+    每个源自带重试; 全部失败 -> 直接 die (exit 1)。"""
+    sources = [
+        # (展示名, URL, 格式, 来源标记, 请求头)
+        ("官方 API", VPNGATE_API, "csv", "vpngate.net/api/iphone",
+         {"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"}),
+        ("jsDelivr 镜像", VPNGATE_MIRROR_CSV, "csv", "jsdelivr/vpngate-list-mirror",
+         {"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"}),
+        ("GitHub 镜像", VPNGATE_MIRROR_JSON, "json", "github-mirror",
+         {"User-Agent": "Mozilla/5.0"}),
+    ]
+    last_exc = None
+    for label, url, fmt, tag, headers in sources:
+        try:
+            log("VPN GATE", f"获取{label}: {url}")
+            resp = _get_with_retries(url, timeout=HTTP_TIMEOUT, headers=headers, label=label)
+            rows = parse_csv(resp.text) if fmt == "csv" else parse_mirror_json(resp.json())
+            if rows:
+                log("VPN GATE", f"{label} 获取到 {len(rows)} 个原始节点")
+                return rows, tag
+            raise RuntimeError(f"{label} 返回 0 行数据")
+        except Exception as exc:
+            last_exc = exc
+            log("VPN GATE", f"{label} 获取失败: {exc}")
+    die("全部数据源均不可用 (官方 API / jsDelivr 镜像 / GitHub 镜像), "
+        f"数据源完全失败 (不生成空结果, 本次运行判定失败): {last_exc}")
 
 
 def parse_csv(text):
