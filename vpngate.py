@@ -128,18 +128,60 @@ def die(msg):
 # ---------------------------------------------------------------------------
 # 第 1 步: 获取 VPN Gate 原始节点
 # ---------------------------------------------------------------------------
+# ============================================================================
+# vpngate.py 修复补丁: 数据源获取加重试 (解决 Actions 偶发 11 秒失败)
+#
+# 用法: 用下面整个代码块, 替换 vpngate.py 第 128~163 行
+#   (从 "# ---------------------------------------------------------------------------"
+#    紧接着 "# 第 1 步: 获取 VPN Gate 原始节点" 的那段,
+#    到 'die("VPN Gate 官方 API 与回退镜像均不可用, ...")' 那一行为止)
+#
+# 改动说明:
+#   - 每个数据源(官方 API / GitHub 镜像)失败后会自动重试, 默认 3 次,
+#     每次间隔 3 秒、8 秒 (可通过环境变量 FETCH_RETRIES / FETCH_BACKOFF 调整)
+#   - 只有两个源、每次重试都失败, 才会 die (exit 1)
+#   - 日志里会打出 "第x/3次" 和等待秒数, 方便以后看日志判断
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 第 1 步: 获取 VPN Gate 原始节点
+# ---------------------------------------------------------------------------
+FETCH_RETRIES = max(1, int(os.environ.get("FETCH_RETRIES", "3")))  # 每个数据源重试次数
+FETCH_BACKOFF = os.environ.get("FETCH_BACKOFF", "3,8")              # 重试等待秒数 (逗号分隔)
+
+
+def _get_with_retries(url, timeout, headers, label):
+    """带重试的 GET: runner 侧偶发网络抖动时多试几次, 避免一次失败就整轮作废。
+    返回 response; 全部失败则抛出最后一个异常。"""
+    backoffs = [float(x) for x in FETCH_BACKOFF.split(",") if x.strip()]
+    last_exc = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:  # noqa: BLE001 - 任何网络/HTTP异常都重试
+            last_exc = exc
+            log("VPN GATE", f"{label} 请求失败 (第{attempt}/{FETCH_RETRIES}次): {exc}")
+            if attempt < FETCH_RETRIES:
+                wait = backoffs[min(attempt - 1, len(backoffs) - 1)] if backoffs else 3
+                log("VPN GATE", f"{wait:g} 秒后重试…")
+                time.sleep(wait)
+    raise last_exc
+
+
 def fetch_vpngate():
     """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
-    官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
+    官方 API 失败时回退镜像 JSON; 两个源各重试多次后仍失败 -> 直接 die (exit 1)。"""
     # --- 主源: 官方 CSV ---
     try:
         log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(
+        resp = _get_with_retries(
             VPNGATE_API,
             timeout=HTTP_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
+            label="官方 API",
         )
-        resp.raise_for_status()
         rows = parse_csv(resp.text)
         if rows:
             log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
@@ -151,8 +193,12 @@ def fetch_vpngate():
     # --- 回退源: GitHub 预解析镜像 ---
     try:
         log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
-        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
+        resp = _get_with_retries(
+            VPNGATE_MIRROR,
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+            label="回退镜像",
+        )
         rows = parse_mirror_json(resp.json())
         if rows:
             log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
